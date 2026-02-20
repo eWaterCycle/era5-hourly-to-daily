@@ -26,3 +26,6 @@ A repository storing our code to go from era5 hourly data, taken with era5cli, t
    - here you need to check the home folders again
    - and the `correct_data_dict`
    - you can change the `test_variables` beware that the plot that is generated is hardcoded to be 2x2, so 4 variables.
+
+For questions or if you need some data to test it on, please reach out to the [eWaterCycle team](https://www.ewatercycle.org/contact/)!
+
