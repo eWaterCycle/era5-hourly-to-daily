@@ -1,0 +1,1 @@
+here we locally store the data that we already had, so we have a baseline of what is good data for ESMValTool.

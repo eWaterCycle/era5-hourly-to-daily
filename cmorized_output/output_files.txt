@@ -1,0 +1,2 @@
+The python script will place the outputs here.
+The testing notebook will look at data that is known to be good and then visually compare.
