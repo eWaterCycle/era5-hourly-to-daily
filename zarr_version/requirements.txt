@@ -1,0 +1,14 @@
+# Dependencies for zarr_era5.py
+xarray>=2024.1
+zarr>=3.0
+dask
+fsspec
+aiohttp          # fsspec's async HTTP backend, needed to read the ARCO stores
+netCDF4
+numpy
+pandas
+python-dotenv
+
+# Optional: when installed, CMOR units/standard names are taken from the
+# official CMIP6 tables instead of the built-in fallback in zarr_era5.py.
+# esmvalcore
