@@ -1175,7 +1175,27 @@ def run_job(
         _quiet_unlink(partial)
         raise
     job_elapsed = time.monotonic() - job_started
-    os.replace(partial, job.out_path)
+
+    # On Windows os.replace fails if anything holds the destination open -- a
+    # Jupyter kernel that called xr.open_dataset on it is the usual culprit.
+    # The data is already safely written, so wait rather than throw it away.
+    for attempt in range(1, 7):
+        try:
+            os.replace(partial, job.out_path)
+            break
+        except PermissionError as err:
+            if attempt == 6:
+                raise PermissionError(
+                    f"{job.out_path.name} is open in another program, so the finished "
+                    "file could not be moved into place. Close it (e.g. restart the "
+                    "Jupyter kernel, or call ds.close()) and rerun -- the completed "
+                    f"data is kept as {partial.name}, nothing was lost."
+                ) from err
+            print(
+                f"{prefix} [WAIT] {job.out_path.name} is locked by another process; "
+                f"retrying in 10s ({attempt}/5)"
+            )
+            time.sleep(10)
 
     on_disk = job.out_path.stat().st_size
     rate = size / job_elapsed if job_elapsed > 0 else 0.0
