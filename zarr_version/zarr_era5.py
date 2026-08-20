@@ -286,11 +286,34 @@ def global_attributes(spec: VarSpec, dataset: str, source: str, table: str, freq
         "frequency": frequency,
         "modeling_realm": "atmos",
         "reference": "era5",
-        "comment": (
-            "Hourly ARCO Zarr data from the Copernicus Climate Data Store, "
-            f"CMORized to {spec.cmor_name} by zarr_era5.py."
-        ),
+        "comment": _provenance_comment(spec, dataset, source),
     }
+
+
+# ERA5 and ERA5-Land define potential evaporation differently, and the two must
+# never be presented as interchangeable. Record which one this file holds.
+PET_DEFINITION = {
+    "ERA5-Land": "open-water (pan) evaporation",
+    "ERA5": "evaporation over well-watered agricultural land",
+}
+
+
+def _provenance_comment(spec: VarSpec, dataset: str, source: str) -> str:
+    """State honestly where the numbers came from and what they mean."""
+    if "arco.datastores" in source:
+        origin = f"Hourly {dataset} ARCO Zarr data"
+    else:
+        origin = (
+            f"{dataset} daily accumulations, taken from the 00:00 UTC field of the "
+            "following day via the CDS request API"
+        )
+    comment = f"{origin}, CMORized to {spec.cmor_name} by zarr_era5.py."
+    if spec.cmor_name == "evspsblpot" and dataset in PET_DEFINITION:
+        comment += (
+            f" Note: {dataset} potential evaporation is {PET_DEFINITION[dataset]}; "
+            "the ERA5 and ERA5-Land definitions differ and are not interchangeable."
+        )
+    return comment
 
 
 def _cell_bounds(values: np.ndarray) -> np.ndarray:
@@ -508,7 +531,13 @@ def cds_daily_totals(
     # 1 January of the next year carries 31 December's total.
     paths += fetch_cds_midnight_month(collection, spec, year + 1, 1, cache_dir, api_key, area)
 
-    ds = xr.open_mfdataset(sorted(paths), combine="by_coords", chunks={})
+    # Keep each horizontal field whole: the files are chunked 4-deep along
+    # longitude, and the [0,360) -> [-180,180] roll would otherwise cross chunk
+    # boundaries and force an expensive rechunk on every read.
+    ds = xr.open_mfdataset(
+        sorted(paths), combine="by_coords",
+        chunks={"valid_time": 8, "latitude": -1, "longitude": -1},
+    )
     if spec.era5_name not in ds:
         raise KeyError(f"{spec.era5_name!r} not in the CDS download (has {list(ds.data_vars)})")
     da = ds[spec.era5_name]
@@ -582,9 +611,26 @@ def _tidy_coordinates(ds: xr.Dataset) -> xr.Dataset:
     if "lat" in ds.coords and np.any(np.diff(ds["lat"].values) < 0):
         print("[FIX] Reversing latitude to be ascending (-90 -> +90).")
         ds = ds.sortby("lat")
-    if "lon" in ds.coords and np.any(np.diff(ds["lon"].values) < 0):
-        print("[FIX] Sorting longitude ascending.")
-        ds = ds.sortby("lon")
+    if "lon" in ds.coords:
+        # The ARCO stores use [-180, 180] but the CDS request API returns
+        # [0, 360). Normalise to [-180, 180] so every variable in a dataset
+        # lands on exactly the same grid regardless of which source it came from.
+        lon = ds["lon"].values
+        if np.any(lon > 180.0):
+            print("[FIX] Wrapping longitude from [0, 360) to [-180, 180].")
+            wrapped = np.where(lon > 180.0, lon - 360.0, lon)
+            ds = ds.assign_coords(lon=wrapped)
+            # Wrapping leaves the axis cyclically rotated rather than randomly
+            # ordered, so roll it back into place. sortby() would work too, but
+            # it is a fancy-index shuffle: with the CDS files chunked 4-deep
+            # along longitude that becomes an all-to-all rechunk behind HDF5's
+            # global read lock, which effectively hangs. roll is a slice+concat.
+            shift = int(np.argmin(wrapped))
+            if shift:
+                ds = ds.roll(lon=-shift, roll_coords=True)
+        if np.any(np.diff(ds["lon"].values) < 0):
+            print("[FIX] Sorting longitude ascending.")
+            ds = ds.sortby("lon")
     return ds.sortby("time")
 
 
@@ -946,6 +992,15 @@ def plan_jobs(args: argparse.Namespace, output_dir: Path) -> tuple[list[Job], in
         spec = VARIABLES[cmor_name]
         via_cds = spec.cds_name is not None
 
+        if via_cds and collection.cds_dataset != "reanalysis-era5-land":
+            print(
+                f"[SKIP] {cmor_name}: only supported for --collection era5-land. "
+                f"{collection.dataset} stores hourly accumulations, so the 00:00 "
+                "shortcut does not apply; use py_cmor.py with an era5cli download."
+            )
+            failures += 1
+            continue
+
         if via_cds:
             # Not in ARCO; downloaded from the CDS request API instead.
             hourly_da = None
@@ -1219,7 +1274,10 @@ def build_parser() -> argparse.ArgumentParser:
         nargs="+",
         choices=sorted(VARIABLES),
         default=["tas", "pr", "rsds"],
-        help="CMOR short names (default: the three available as ARCO Zarr)",
+        help="CMOR short names. The default is the three ARCO Zarr variables, which "
+             "stream fast. evspsblpot and evspsbl are supported but opt-in: they go "
+             "through the CDS request API (~13 queued requests per year, ERA5-Land "
+             "daily only), so they are not run unless you ask for them.",
     )
     parser.add_argument("--frequency", choices=("day", "hour", "both"), default="both")
     parser.add_argument(
