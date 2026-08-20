@@ -536,7 +536,7 @@ def cds_daily_totals(
     # boundaries and force an expensive rechunk on every read.
     ds = xr.open_mfdataset(
         sorted(paths), combine="by_coords",
-        chunks={"valid_time": 8, "latitude": -1, "longitude": -1},
+        chunks={"longitude": -1},  # time keeps the files' own chunking
     )
     if spec.era5_name not in ds:
         raise KeyError(f"{spec.era5_name!r} not in the CDS download (has {list(ds.data_vars)})")
@@ -552,7 +552,15 @@ def cds_daily_totals(
     da = da.assign_coords({time_name: stamps})
     if time_name != "time":
         da = da.rename({time_name: "time"})
-    da = da.sortby("time").sel(time=str(year))
+    # Only reorder if genuinely needed: sortby on a dask array is a fancy-index
+    # shuffle across every file, whereas .sel on a monotonic index is a cheap
+    # slice. combine="by_coords" already sorts, and shifting every stamp back by
+    # one day preserves that order, so this is normally a no-op.
+    stamps_sorted = bool((np.diff(da["time"].values).astype("timedelta64[s]").astype(int) > 0).all())
+    if not stamps_sorted:
+        print("[FIX] Sorting CDS time steps.")
+        da = da.sortby("time")
+    da = da.sel(time=str(year))
 
     expected = 366 if calendar.isleap(year) else 365
     if da.sizes["time"] != expected:
