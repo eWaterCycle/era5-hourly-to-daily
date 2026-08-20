@@ -8,6 +8,7 @@ netCDF4
 numpy
 pandas
 python-dotenv
+cdsapi          # CDS request API, needed only for evspsblpot/evspsbl
 
 # Optional: when installed, CMOR units/standard names are taken from the
 # official CMIP6 tables instead of the built-in fallback in zarr_era5.py.

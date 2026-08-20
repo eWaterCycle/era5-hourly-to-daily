@@ -30,10 +30,12 @@ Notes on the ARCO stores (checked against the live stores, August 2026)
   latitude is already ascending, so several of the fixups in ``py_cmor.py``
   (``valid_time`` renaming, ``number`` dropping, latitude flipping) are
   no-ops here.  They are kept as defensive checks.
-* Evaporation is **not** published as ARCO Zarr.  ``pev``/``evspsblpot`` and
-  ``e``/``evspsbl`` are listed in ``VARIABLES`` below for completeness, but
-  they can only be produced from the classic CDS request (i.e. keep using
-  ``py_cmor.py`` for those two).
+* Evaporation is **not** published as ARCO Zarr, so ``pev``/``evspsblpot`` and
+  ``e``/``evspsbl`` are fetched from the classic CDS request API instead
+  (needs ``cdsapi``).  Via the CDS, ERA5-Land accumulates from 00 UTC, so only
+  the 00:00 field of each day is downloaded -- that value is already the
+  previous day's total, which is 24x less data than the hourly series.  These
+  two are daily-only, and carry ESMValCore's -1 sign correction.
 
 Adding a variable
 -----------------
@@ -58,6 +60,7 @@ import os
 import sys
 import time
 import traceback
+import zipfile
 import warnings
 from dataclasses import dataclass
 from pathlib import Path
@@ -92,6 +95,7 @@ class Collection:
 
     root: str  # path segment, e.g. "reanalysis_era5_land"
     dataset: str  # ESMValTool dataset name, used in the output filename
+    cds_dataset: str  # CDS request-API collection id, for the non-ARCO variables
     stores: tuple[Store, ...]
 
     def store_for(self, era5_name: str) -> Store:
@@ -110,6 +114,7 @@ COLLECTIONS: dict[str, Collection] = {
         # Matches ESMValCore's native6 dataset name (esmvalcore/cmor/_fixes/
         # native6/era5_land.py), so ESMValTool recognises the files.
         dataset="ERA5-Land",
+        cds_dataset="reanalysis-era5-land",
         stores=(
             Store("005", "sfc-soil-water", ("swvl1", "swvl2", "swvl3", "swvl4")),
             Store("006", "sfc-soil-temperature", ("stl1", "stl2", "stl3", "stl4")),
@@ -124,6 +129,7 @@ COLLECTIONS: dict[str, Collection] = {
     "era5": Collection(
         root="reanalysis_era5_single_levels",
         dataset="ERA5",
+        cds_dataset="reanalysis-era5-single-levels",
         stores=(
             Store(
                 "002",
@@ -154,15 +160,24 @@ class VarSpec:
     hour_table: str  # CMOR table used for the hourly files
     factor: float  # multiply the raw ERA5 values by this
     instantaneous: bool  # True for state variables, False for accumulations
+    cds_name: str | None = None  # CDS request-API name, for fields absent from ARCO
+    sign: float = 1.0  # ESMValCore flips evaporation to the CMOR sign convention
 
 
 VARIABLES: dict[str, VarSpec] = {
     "tas": VarSpec("t2m", "tas", "day", "E1hr", 1.0, instantaneous=True),
     "pr": VarSpec("tp", "pr", "day", "E1hr", 1 / 3.6, instantaneous=False),
     "rsds": VarSpec("ssrd", "rsds", "day", "E1hr", 1 / 3600, instantaneous=False),
-    # Not published as ARCO Zarr -- kept so the mapping stays complete.
-    "evspsblpot": VarSpec("pev", "evspsblpot", "Eday", "E1hr", 1 / 3.6, instantaneous=False),
-    "evspsbl": VarSpec("e", "evspsbl", "Eday", "E1hr", 1 / 3.6, instantaneous=False),
+    # Not in ARCO: fetched from the CDS request API instead. Because ERA5-Land
+    # accumulates from 00 UTC, we fetch only the 00:00 field, which is already the
+    # daily total, so the factor converts m/day (not m/hour) to kg m-2 s-1:
+    # 1000 kg m-3 / 86400 s = 1/86.4. The -1 matches ESMValCore's native6 fixes
+    # (esmvalcore/cmor/_fixes/native6/era5.py), which flip ERA5's downward-positive
+    # evaporation to the CMOR convention.
+    "evspsblpot": VarSpec("pev", "evspsblpot", "Eday", "E1hr", 1 / 86.4, instantaneous=False,
+                          cds_name="potential_evaporation", sign=-1.0),
+    "evspsbl": VarSpec("e", "evspsbl", "Eday", "E1hr", 1 / 86.4, instantaneous=False,
+                       cds_name="total_evaporation", sign=-1.0),
 }
 
 # Used when ESMValCore is not installed, and for the fields ESMValCore does not
@@ -387,6 +402,159 @@ def select_period(da: xr.DataArray, start: pd.Timestamp, end: pd.Timestamp, labe
             stacklevel=2,
         )
     return sliced
+
+
+# ---------------------------------------------------------------------------
+# CDS request-API source, for the variables the ARCO stores do not publish
+# ---------------------------------------------------------------------------
+
+CDS_API_URL = "https://cds.climate.copernicus.eu/api"
+
+
+def _cds_client(api_key: str):
+    try:
+        import cdsapi
+    except ImportError as err:  # pragma: no cover
+        raise SystemExit(
+            "The evaporation variables need the CDS request API. "
+            "Install it with `pip install cdsapi`."
+        ) from err
+    return cdsapi.Client(url=CDS_API_URL, key=api_key, quiet=True, progress=False)
+
+
+def _unzip_netcdf(archive: Path, target_dir: Path) -> list[Path]:
+    """CDS returns netCDF wrapped in a zip; unpack and return the members."""
+    if not zipfile.is_zipfile(archive):
+        return [archive]
+    with zipfile.ZipFile(archive) as zf:
+        members = [n for n in zf.namelist() if n.endswith(".nc")]
+        zf.extractall(target_dir)
+    return [target_dir / name for name in members]
+
+
+def fetch_cds_midnight_month(
+    collection: Collection,
+    spec: VarSpec,
+    year: int,
+    month: int,
+    cache_dir: Path,
+    api_key: str,
+    area: list[float] | None = None,
+) -> list[Path]:
+    """Download the 00:00 UTC field for every day of one month.
+
+    ERA5-Land accumulates from 00 UTC, so the 00:00 value of day D+1 already is
+    the complete daily total for day D (verified against the hourly series).
+    Fetching only that hour is 24x less data than the full hourly series, which
+    is what makes a global 0.1 degree year practical at all.
+    """
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    tag = "global" if area is None else "sub"
+    stem = f"{collection.cds_dataset}_{spec.cds_name}_{tag}_{year}{month:02d}"
+    extracted = sorted(cache_dir.glob(f"{stem}__*.nc"))
+    if extracted:
+        return extracted
+
+    archive = cache_dir / f"{stem}.download"
+    request = {
+        "variable": [spec.cds_name],
+        "year": str(year),
+        "month": f"{month:02d}",
+        "day": [f"{d:02d}" for d in range(1, calendar.monthrange(year, month)[1] + 1)],
+        "time": ["00:00"],
+        "data_format": "netcdf",
+    }
+    if area is not None:
+        request["area"] = area
+
+    print(f"[CDS]  requesting {spec.cds_name} {year}-{month:02d} ({len(request['day'])} fields)")
+    started = time.monotonic()
+    _cds_client(api_key).retrieve(collection.cds_dataset, request, str(archive))
+    members = _unzip_netcdf(archive, cache_dir)
+
+    renamed = []
+    for index, member in enumerate(members):
+        target = cache_dir / f"{stem}__{index}.nc"
+        os.replace(member, target)
+        renamed.append(target)
+    archive.unlink(missing_ok=True)
+    print(f"[CDS]  got {year}-{month:02d} in {human_time(time.monotonic() - started)}")
+    return renamed
+
+
+def cds_daily_totals(
+    collection: Collection,
+    spec: VarSpec,
+    year: int,
+    cache_dir: Path,
+    api_key: str,
+    area: list[float] | None = None,
+) -> xr.DataArray:
+    """Daily accumulation totals for `year`, from the 00:00 UTC fields.
+
+    The 00:00 field of day D+1 holds the total for day D, so January needs the
+    following 1 January as well, and every stamp is shifted back one day.
+    """
+    if collection.cds_dataset != "reanalysis-era5-land":
+        raise ValueError(
+            f"the 00:00-accumulation shortcut is only valid for ERA5-Land; "
+            f"{collection.dataset} stores hourly accumulations, so use py_cmor.py "
+            f"with an era5cli download for {spec.cmor_name}"
+        )
+
+    paths: list[Path] = []
+    for month in range(1, 13):
+        paths += fetch_cds_midnight_month(collection, spec, year, month, cache_dir, api_key, area)
+    # 1 January of the next year carries 31 December's total.
+    paths += fetch_cds_midnight_month(collection, spec, year + 1, 1, cache_dir, api_key, area)
+
+    ds = xr.open_mfdataset(sorted(paths), combine="by_coords", chunks={})
+    if spec.era5_name not in ds:
+        raise KeyError(f"{spec.era5_name!r} not in the CDS download (has {list(ds.data_vars)})")
+    da = ds[spec.era5_name]
+
+    for extra in ("number", "expver"):
+        if extra in da.coords:
+            da = da.drop_vars(extra)
+    time_name = "valid_time" if "valid_time" in da.dims else "time"
+
+    # Shift each 00:00 stamp back to the day it actually accumulated over.
+    stamps = pd.to_datetime(da[time_name].values) - pd.Timedelta(days=1)
+    da = da.assign_coords({time_name: stamps})
+    if time_name != "time":
+        da = da.rename({time_name: "time"})
+    da = da.sortby("time").sel(time=str(year))
+
+    expected = 366 if calendar.isleap(year) else 365
+    if da.sizes["time"] != expected:
+        warnings.warn(
+            f"{spec.cmor_name} {year}: got {da.sizes['time']} days, expected {expected}",
+            stacklevel=2,
+        )
+    return da
+
+
+def cds_daily_dataset(collection: Collection, spec: VarSpec, year: int, da: xr.DataArray) -> xr.Dataset:
+    """Turn CDS daily totals into the same shape to_daily() produces."""
+    daily = da * (spec.factor * spec.sign)
+    daily.name = spec.cmor_name
+    print(
+        f"[INFO] Converted {spec.cmor_name} using factor 1/{1 / spec.factor:.1f}"
+        f"{' and sign -1' if spec.sign < 0 else ''}"
+    )
+
+    ds = daily.to_dataset()
+    ds = _tidy_coordinates(ds)
+
+    day_starts = pd.to_datetime(ds["time"].values).normalize()
+    ds = ds.assign_coords(time=("time", day_starts + pd.Timedelta(hours=12)))
+    ds["time_bnds"] = (
+        ("time", "bnds"),
+        np.column_stack(
+            [day_starts.values, (day_starts + pd.Timedelta(hours=24)).values]
+        ).astype("datetime64[ns]"),
+    )
+    return ds
 
 
 # ---------------------------------------------------------------------------
@@ -751,7 +919,7 @@ class Job:
 
     spec: VarSpec
     source: str
-    hourly_da: xr.DataArray
+    hourly_da: xr.DataArray | None  # None for CDS-sourced variables
     year: int
     daily: bool
     table: str
@@ -776,22 +944,37 @@ def plan_jobs(args: argparse.Namespace, output_dir: Path) -> tuple[list[Job], in
 
     for cmor_name in args.variables:
         spec = VARIABLES[cmor_name]
-        try:
-            hourly_da, source = open_hourly(
-                collection, spec, api_key, args.chunking, args.time_chunk,
-                args.space_chunk, args.http_timeout,
-            )
-        except (KeyError, OSError, ValueError) as err:
-            print(f"[SKIP] {cmor_name}: {err}")
-            failures += 1
-            continue
+        via_cds = spec.cds_name is not None
 
-        print(f"[INFO] {cmor_name}: {source}")
-        print(f"[INFO] store covers {hourly_da.time.values[0]} .. {hourly_da.time.values[-1]}")
+        if via_cds:
+            # Not in ARCO; downloaded from the CDS request API instead.
+            hourly_da = None
+            source = f"{CDS_API_URL} :: {collection.cds_dataset} :: {spec.cds_name}"
+            print(f"[INFO] {cmor_name}: via CDS request API ({collection.cds_dataset})")
+            if "hour" in frequencies:
+                print(
+                    f"[SKIP] {cmor_name}: hourly output is not supported for CDS-sourced "
+                    "variables (it would need the full 8760-step download)"
+                )
+        else:
+            try:
+                hourly_da, source = open_hourly(
+                    collection, spec, api_key, args.chunking, args.time_chunk,
+                    args.space_chunk, args.http_timeout,
+                )
+            except (KeyError, OSError, ValueError) as err:
+                print(f"[SKIP] {cmor_name}: {err}")
+                failures += 1
+                continue
+
+            print(f"[INFO] {cmor_name}: {source}")
+            print(f"[INFO] store covers {hourly_da.time.values[0]} .. {hourly_da.time.values[-1]}")
 
         for year in args.years:
             for frequency in frequencies:
                 daily = frequency == "day"
+                if via_cds and not daily:
+                    continue
                 table = spec.day_table if daily else spec.hour_table
                 split = "year" if daily else args.hourly_split
                 for label, start, end in periods(year, split):
@@ -875,9 +1058,29 @@ def run_job(
 ) -> tuple[int, float]:
     """Build and write one output file. Returns (bytes on disk, seconds)."""
     spec = job.spec
-    dataset = COLLECTIONS[args.collection].dataset
-    raw = select_period(job.hourly_da, job.start, job.end, f"{spec.cmor_name} {job.label}")
-    ds = to_daily(raw, spec) if job.daily else to_hourly(raw, spec)
+    collection = COLLECTIONS[args.collection]
+    dataset = collection.dataset
+
+    if spec.cds_name is not None and args.dry_run:
+        # Never fetch under --dry-run: the CDS path downloads before it can know
+        # the real shape, so report the plan instead.
+        days = 366 if calendar.isleap(job.year) else 365
+        print(
+            f"{prefix} {job.out_path.name}: {days} days via {collection.cds_dataset}, "
+            f"13 CDS requests ({spec.cds_name}, 00:00 fields only)"
+        )
+        return 0, 0.0
+
+    if spec.cds_name is not None:
+        totals = cds_daily_totals(
+            collection, spec, job.year,
+            Path(args.cds_cache).expanduser().resolve(),
+            load_api_key(), args.area,
+        )
+        ds = cds_daily_dataset(collection, spec, job.year, totals)
+    else:
+        raw = select_period(job.hourly_da, job.start, job.end, f"{spec.cmor_name} {job.label}")
+        ds = to_daily(raw, spec) if job.daily else to_hourly(raw, spec)
     ds = finalise(ds, spec, job.daily, dataset, job.source, job.table)
 
     if job.daily and reference_dir is not None:
@@ -1062,6 +1265,21 @@ def build_parser() -> argparse.ArgumentParser:
              "as a timeout (default: 300)",
     )
     parser.add_argument(
+        "--cds-cache",
+        default="cds_cache",
+        help="where CDS downloads are kept so reruns do not refetch them "
+             "(default: ./cds_cache). Only used for evspsblpot/evspsbl.",
+    )
+    parser.add_argument(
+        "--area",
+        type=float,
+        nargs=4,
+        metavar=("NORTH", "WEST", "SOUTH", "EAST"),
+        default=None,
+        help="optional CDS subset box for evspsblpot/evspsbl, e.g. --area 53 4 51 7. "
+             "Omit for the whole globe.",
+    )
+    parser.add_argument(
         "--overwrite",
         action="store_true",
         help="rebuild files that already exist instead of skipping them",
@@ -1101,11 +1319,11 @@ def main(argv: list[str] | None = None) -> int:
 
     args = build_parser().parse_args(argv)
 
-    unavailable = [v for v in args.variables if VARIABLES[v].era5_name in ("pev", "e")]
-    if unavailable:
+    via_cds = [v for v in args.variables if VARIABLES[v].cds_name]
+    if via_cds:
         print(
-            f"[WARN] {', '.join(unavailable)}: evaporation is not published as ARCO Zarr "
-            "by the CDS. Keep using py_cmor.py with a classic CDS/era5cli download for these."
+            f"[INFO] {', '.join(via_cds)}: not published as ARCO Zarr, so these come from "
+            "the CDS request API (daily output only; needs `pip install cdsapi`)."
         )
 
     if args.frequency in ("hour", "both") and not args.dry_run:

@@ -129,9 +129,18 @@ are skipped unless you pass `--overwrite`.
   daily. Use `--dry-run` first, and `--hourly-split month` to keep individual files
   manageable. Existing output files are skipped unless you pass `--overwrite`, so an
   interrupted run resumes.
-- **Only `tas`, `pr` and `rsds` are available.** `evspsblpot` and `evspsbl` are *not*
-  published as ARCO zarr by the CDS, in either collection — keep using `py_cmor.py` with
-  an `era5cli`/CDS download for those two.
+- **`tas`, `pr` and `rsds` come from ARCO zarr. `evspsblpot` and `evspsbl` do not** —
+  evaporation is not published as ARCO in either collection, so those two are fetched
+  from the classic CDS request API instead (`pip install cdsapi`; the same token is
+  used). They are **daily-only**, and only for `--collection era5-land`. Because
+  ERA5-Land accumulates from 00 UTC there, only the 00:00 field of each day is
+  downloaded — that value is already the previous day's total, so it is 24x less data
+  than the hourly series. Use `--area N W S E` to fetch a box instead of the globe, and
+  `--cds-cache` to control where downloads are kept (reruns do not refetch).
+- **Both evaporation variables carry a `-1` sign correction**, matching ESMValCore's
+  native6 fixes, which flip ERA5's downward-positive evaporation to the CMOR convention.
+  Note that `py_cmor.py` does *not* do this, so its `evspsblpot`/`evspsbl` output has the
+  opposite sign.
 - Accumulated fields (`tp`, `ssrd`) are stored as **hourly** accumulations in both ARCO
   collections — ERA5-Land is *not* stored with the usual "accumulated since 00 UTC"
   convention here. So the conversion factors from `py_cmor.py` carry over unchanged and a
