@@ -35,7 +35,11 @@ Notes on the ARCO stores (checked against the live stores, August 2026)
   (needs ``cdsapi``).  Via the CDS, ERA5-Land accumulates from 00 UTC, so only
   the 00:00 field of each day is downloaded -- that value is already the
   previous day's total, which is 24x less data than the hourly series.  These
-  two are daily-only, and carry ESMValCore's -1 sign correction.
+  two are daily-only.  ERA5-Land reports evaporation as a positive magnitude
+  (unlike ERA5's downward-positive convention, where evaporation is already
+  negative), so the sign needed to make it negative is detected from the
+  fetched data itself rather than hardcoded -- see
+  ``_resolve_evaporation_sign``.
 
 Adding a variable
 -----------------
@@ -171,9 +175,11 @@ VARIABLES: dict[str, VarSpec] = {
     # Not in ARCO: fetched from the CDS request API instead. Because ERA5-Land
     # accumulates from 00 UTC, we fetch only the 00:00 field, which is already the
     # daily total, so the factor converts m/day (not m/hour) to kg m-2 s-1:
-    # 1000 kg m-3 / 86400 s = 1/86.4. The -1 matches ESMValCore's native6 fixes
-    # (esmvalcore/cmor/_fixes/native6/era5.py), which flip ERA5's downward-positive
-    # evaporation to the CMOR convention.
+    # 1000 kg m-3 / 86400 s = 1/86.4. sign=-1.0 is only the default expectation
+    # (ERA5-Land reports evaporation as a positive magnitude, unlike ERA5's
+    # downward-positive convention where it's already negative); the sign
+    # actually applied is verified against the fetched data at runtime, see
+    # _resolve_evaporation_sign.
     "evspsblpot": VarSpec("pev", "evspsblpot", "Eday", "E1hr", 1 / 86.4, instantaneous=False,
                           cds_name="potential_evaporation", sign=-1.0),
     "evspsbl": VarSpec("e", "evspsbl", "Eday", "E1hr", 1 / 86.4, instantaneous=False,
@@ -571,13 +577,55 @@ def cds_daily_totals(
     return da
 
 
+def _resolve_evaporation_sign(da: xr.DataArray, spec: VarSpec, collection: Collection) -> float:
+    """Check the raw CDS sign convention instead of trusting ``VarSpec.sign`` blindly.
+
+    ERA5 stores evaporation downward-positive, so evaporation itself is
+    negative -- that is what ``py_cmor.py`` writes out for plain ERA5, with no
+    sign flip at all. ERA5-Land, fetched here via the CDS request API, has
+    been observed to report it as a positive magnitude instead. Either way,
+    the CMORized output must end up negative (evaporation as a loss), which
+    is the convention common in earth science and the one ERA5 already
+    produces. Rather than hardcode which collection needs the flip, sample a
+    few already-downloaded days and derive it from the data itself.
+    """
+    if spec.sign == 1.0:
+        return spec.sign
+
+    sample = da.isel(time=slice(0, min(5, da.sizes["time"]))).isel(
+        latitude=slice(None, None, 4), longitude=slice(None, None, 4)
+    ).values
+    finite = sample[np.isfinite(sample)]
+    finite = finite[finite != 0]
+    if finite.size == 0:
+        warnings.warn(
+            f"{spec.cmor_name} ({collection.dataset}): could not sample the raw sign "
+            f"convention (no non-zero values found); using the default sign {spec.sign:+.0f}.",
+            stacklevel=2,
+        )
+        return spec.sign
+
+    raw_is_positive = bool(np.median(finite) > 0)
+    resolved = -1.0 if raw_is_positive else 1.0
+    if resolved != spec.sign:
+        warnings.warn(
+            f"{spec.cmor_name} ({collection.dataset}): raw CDS values are "
+            f"{'positive' if raw_is_positive else 'negative'}, which needs sign {resolved:+.0f} "
+            f"to come out negative, not the {spec.sign:+.0f} hardcoded in VarSpec. "
+            "Using the detected sign instead.",
+            stacklevel=2,
+        )
+    return resolved
+
+
 def cds_daily_dataset(collection: Collection, spec: VarSpec, year: int, da: xr.DataArray) -> xr.Dataset:
     """Turn CDS daily totals into the same shape to_daily() produces."""
-    daily = da * (spec.factor * spec.sign)
+    sign = _resolve_evaporation_sign(da, spec, collection)
+    daily = da * (spec.factor * sign)
     daily.name = spec.cmor_name
     print(
         f"[INFO] Converted {spec.cmor_name} using factor 1/{1 / spec.factor:.1f}"
-        f"{' and sign -1' if spec.sign < 0 else ''}"
+        f"{' and sign -1' if sign < 0 else ''}"
     )
 
     ds = daily.to_dataset()
