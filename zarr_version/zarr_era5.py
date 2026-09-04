@@ -688,6 +688,13 @@ def _tidy_coordinates(ds: xr.Dataset) -> xr.Dataset:
         if np.any(np.diff(ds["lon"].values) < 0):
             print("[FIX] Sorting longitude ascending.")
             ds = ds.sortby("lon")
+        # The ARCO stores' lon carries ~1e-10 degree floating-point drift from
+        # their own construction -- far finer than the native 0.1/0.25 degree
+        # resolution, but just enough to push lon_bnds a hair past the
+        # 360-degree modulus (e.g. 360.00000000001324), which breaks Iris's
+        # extract_shape/extract_region ("coordinate's range greater than
+        # coordinate's unit's modulus"). Rounding to 1e-6 degree removes it.
+        ds["lon"] = ds["lon"].copy(data=np.round(ds["lon"].values, 6))
     return ds.sortby("time")
 
 

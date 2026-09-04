@@ -17,6 +17,14 @@ both are cheap to correct in place instead of re-downloading and re-CMORizing:
    request API, but the ARCO Zarr stores used by ``zarr_era5.py`` do not
    publish it at all, so files written before that was added are missing it
    entirely.  Fixing it adds the scalar coordinate back (value 2.0, units m).
+4. **Longitude floating-point drift.**  The ARCO stores' lon carries ~1e-10
+   degree noise from their own construction -- far finer than the native
+   0.1/0.25 degree resolution, but just enough to push ``lon_bnds`` a hair
+   past the 360-degree modulus.  That breaks ESMValCore/Iris's
+   ``extract_shape``/``extract_region`` ("coordinate's range greater than
+   coordinate's unit's modulus"), even on files whose longitude is already
+   correctly wrapped to ``[0, 360)``.  Fixing it rounds lon to 1e-6 degree and
+   rebuilds ``lon_bnds`` from the cleaned axis.
 
 Usage
 -----
@@ -116,6 +124,22 @@ def check_sign(ds: xr.Dataset, name: str, stride: int) -> list[str]:
     return []
 
 
+def check_lon_precision(ds: xr.Dataset) -> list[str]:
+    """Floating-point drift that pushes lon_bnds past the 360 modulus.
+
+    Independent of check_longitude(): a file can already be correctly wrapped
+    to [0, 360) ascending and still carry this, because the drift lives in
+    the raw lon values themselves, not their ordering.
+    """
+    if "lon_bnds" not in ds.variables:
+        return []
+    bnds = np.asarray(ds["lon_bnds"].values, dtype="float64")
+    span = float(bnds.max() - bnds.min())
+    if span > 360.0:
+        return [f"lon_bnds span {span:.9f} degrees, exceeding the 360 modulus by floating-point drift"]
+    return []
+
+
 def check_height(ds: xr.Dataset, name: str) -> list[str]:
     """tas must carry the CMIP6 2 m scalar height coordinate."""
     if name != "tas":
@@ -149,6 +173,26 @@ def fix_longitude(ds: xr.Dataset) -> xr.Dataset:
     if "lon_bnds" in ds.variables:
         # The rolled bounds still carry the old [-180, 180] numbers, so derive
         # them again from the corrected centres.
+        ds["lon_bnds"] = (("lon", "bnds"), _cell_bounds(ds["lon"].values))
+        ds["lon_bnds"].attrs = bnds_attrs
+    return ds
+
+
+def fix_lon_precision(ds: xr.Dataset) -> xr.Dataset:
+    """Round lon to 1e-6 degree and rebuild lon_bnds from the cleaned axis.
+
+    Safe to call whether or not check_lon_precision() flagged this ds: it is
+    idempotent, and fix_longitude() itself derives fresh lon_bnds from
+    possibly still-drifting lon values, so this is also run after a wrap fix
+    to make sure the result is clean.
+    """
+    lon_attrs, lon_encoding = dict(ds["lon"].attrs), dict(ds["lon"].encoding)
+    bnds_attrs = dict(ds["lon_bnds"].attrs) if "lon_bnds" in ds.variables else {}
+    rounded = np.round(np.asarray(ds["lon"].values, dtype="float64"), 6)
+    ds = ds.assign_coords(lon=rounded)
+    ds["lon"].attrs = lon_attrs
+    ds["lon"].encoding = lon_encoding
+    if "lon_bnds" in ds.variables:
         ds["lon_bnds"] = (("lon", "bnds"), _cell_bounds(ds["lon"].values))
         ds["lon_bnds"].attrs = bnds_attrs
     return ds
@@ -209,7 +253,8 @@ def process_file(path: Path, args: argparse.Namespace) -> tuple[str, list[str]]:
         lon_problems = check_longitude(ds)
         sign_problems = check_sign(ds, name, args.sample_stride)
         height_problems = check_height(ds, name)
-        problems = lon_problems + sign_problems + height_problems
+        precision_problems = check_lon_precision(ds)
+        problems = lon_problems + sign_problems + height_problems + precision_problems
         if not problems:
             return "ok", []
         if not args.fix:
@@ -222,6 +267,12 @@ def process_file(path: Path, args: argparse.Namespace) -> tuple[str, list[str]]:
         if lon_problems:
             fixed = fix_longitude(fixed)
             notes.append("longitude rewritten to [0, 360)")
+        if lon_problems or precision_problems:
+            # fix_longitude() derives lon_bnds from lon values that may still
+            # carry drift, so this always runs after it too, not only when
+            # check_lon_precision() flagged the pre-fix file.
+            fixed = fix_lon_precision(fixed)
+            notes.append("lon rounded to 1e-6 degree to keep lon_bnds within the 360 modulus")
         if any("expected negative" in problem for problem in sign_problems):
             fixed = fix_sign(fixed, name)
             notes.append(f"{name} sign flipped to negative")
