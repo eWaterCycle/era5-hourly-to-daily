@@ -122,6 +122,32 @@ The script switches stdout to line buffering itself, so the log fills in as it g
 don't need `python -u`. If a run dies partway, just rerun the same command: finished files
 are skipped unless you pass `--overwrite`.
 
+### Checking and repairing existing output
+
+`zarr_version/fix_cmorized.py` checks a folder of already-written netCDF files for the two
+mistakes earlier versions of this repo made, and can repair them in place instead of
+re-running the whole download:
+
+- longitude written as `[-180, 180]` instead of `[0, 360)`,
+- `evspsblpot`/`evspsbl` stored positive instead of negative.
+
+```bash
+# report only, writes nothing (reads headers, plus a few sampled days for the sign check)
+python zarr_version/fix_cmorized.py cmorized_output
+
+# repair, keeping the originals and writing corrected copies elsewhere
+python zarr_version/fix_cmorized.py cmorized_output --fix --output-dir cmorized_fixed
+
+# repair in place (writes *.partial first, swaps it in only once the write succeeded,
+# so make sure there is room for one extra copy of the largest file)
+python zarr_version/fix_cmorized.py cmorized_output --fix
+```
+
+The repair is a relabel-and-roll of the longitude axis and a multiplication by -1, so the
+values, time axis, attributes, compression and chunking all come through unchanged;
+`lon_bnds` is recomputed and a `history` line records what was altered. Running it again
+on repaired files reports them as already correct.
+
 ### Important notes
 
 - **The script works on the full global grid.** One year of global *hourly* ERA5-Land is
@@ -137,6 +163,9 @@ are skipped unless you pass `--overwrite`.
   downloaded — that value is already the previous day's total, so it is 24x less data
   than the hourly series. Use `--area N W S E` to fetch a box instead of the globe, and
   `--cds-cache` to control where downloads are kept (reruns do not refetch).
+- **Longitude is written as `[0, 360)`**, ascending, matching the ARCO stores' own
+  ERA5-Land grid after the wrap. Output written before this was `[-180, 180]`; run
+  `zarr_version/fix_cmorized.py` over those files rather than rebuilding them.
 - **Both evaporation variables carry a `-1` sign correction**, matching ESMValCore's
   native6 fixes, which flip ERA5's downward-positive evaporation to the CMOR convention.
   Note that `py_cmor.py` does *not* do this, so its `evspsblpot`/`evspsbl` output has the

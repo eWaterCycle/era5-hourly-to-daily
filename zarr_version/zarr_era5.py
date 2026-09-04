@@ -538,8 +538,9 @@ def cds_daily_totals(
     paths += fetch_cds_midnight_month(collection, spec, year + 1, 1, cache_dir, api_key, area)
 
     # Keep each horizontal field whole: the files are chunked 4-deep along
-    # longitude, and the [0,360) -> [-180,180] roll would otherwise cross chunk
-    # boundaries and force an expensive rechunk on every read.
+    # longitude, which makes any longitude-wise operation cross chunk
+    # boundaries and force an expensive rechunk on every read. (The CDS
+    # download is already on [0, 360), so no wrap is needed here.)
     ds = xr.open_mfdataset(
         sorted(paths), combine="by_coords",
         chunks={"longitude": -1},  # time keeps the files' own chunking
@@ -668,19 +669,19 @@ def _tidy_coordinates(ds: xr.Dataset) -> xr.Dataset:
         print("[FIX] Reversing latitude to be ascending (-90 -> +90).")
         ds = ds.sortby("lat")
     if "lon" in ds.coords:
-        # The ARCO stores use [-180, 180] but the CDS request API returns
-        # [0, 360). Normalise to [-180, 180] so every variable in a dataset
-        # lands on exactly the same grid regardless of which source it came from.
+        # The ARCO stores use [-180, 180] and the CDS request API returns
+        # [0, 360). Normalise to [0, 360) so every variable in a dataset lands
+        # on exactly the same grid regardless of which source it came from.
         lon = ds["lon"].values
-        if np.any(lon > 180.0):
-            print("[FIX] Wrapping longitude from [0, 360) to [-180, 180].")
-            wrapped = np.where(lon > 180.0, lon - 360.0, lon)
+        if np.any(lon < 0.0):
+            print("[FIX] Wrapping longitude from [-180, 180] to [0, 360).")
+            wrapped = np.where(lon < 0.0, lon + 360.0, lon)
             ds = ds.assign_coords(lon=wrapped)
             # Wrapping leaves the axis cyclically rotated rather than randomly
             # ordered, so roll it back into place. sortby() would work too, but
-            # it is a fancy-index shuffle: with the CDS files chunked 4-deep
-            # along longitude that becomes an all-to-all rechunk behind HDF5's
-            # global read lock, which effectively hangs. roll is a slice+concat.
+            # it is a fancy-index shuffle: on a store chunked along longitude
+            # that becomes an all-to-all rechunk behind HDF5's global read
+            # lock, which effectively hangs. roll is a slice+concat.
             shift = int(np.argmin(wrapped))
             if shift:
                 ds = ds.roll(lon=-shift, roll_coords=True)
