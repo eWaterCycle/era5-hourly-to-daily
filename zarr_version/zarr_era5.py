@@ -745,6 +745,26 @@ def to_hourly(da: xr.DataArray, spec: VarSpec) -> xr.Dataset:
     return ds
 
 
+def add_height_coordinate(ds: xr.Dataset, spec: VarSpec) -> xr.Dataset:
+    """Attach the CMIP6 2 m scalar ``height`` coordinate that tas needs.
+
+    ERA5 t2m already carries this when it comes from era5cli/the CDS request
+    API (py_cmor.py just promotes it to a coordinate); the ARCO Zarr stores
+    used here do not publish it at all, so it has to be added by hand.
+    """
+    if spec.cmor_name != "tas" or "height" in ds.coords:
+        return ds
+    ds = ds.assign_coords(height=np.float64(2.0))
+    ds["height"].attrs = {
+        "long_name": "height",
+        "standard_name": "height",
+        "units": "m",
+        "positive": "up",
+        "axis": "Z",
+    }
+    return ds
+
+
 def finalise(
     ds: xr.Dataset,
     spec: VarSpec,
@@ -773,6 +793,7 @@ def finalise(
         "axis": "T",
         **({"bounds": "time_bnds"} if "time_bnds" in ds else {}),
     }
+    ds = add_height_coordinate(ds, spec)
     ds = add_spatial_bounds(ds)
     ds.attrs = global_attributes(spec, dataset, source, table, "day" if daily else "1hr")
     return ds
@@ -853,6 +874,8 @@ def build_encoding(ds: xr.Dataset, spec: VarSpec, daily: bool, complevel: int) -
         "lat": {"dtype": "float64", "_FillValue": None},
         "lon": {"dtype": "float64", "_FillValue": None},
     }
+    if "height" in ds.coords:
+        encoding["height"] = {"dtype": "float64", "_FillValue": None}
     # apply_reference_metadata() copies the reference file's time encoding onto
     # the dataset; when that happened, it wins over the default above.
     if ds["time"].encoding.get("units"):

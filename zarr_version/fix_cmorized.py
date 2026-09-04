@@ -12,6 +12,11 @@ both are cheap to correct in place instead of re-downloading and re-CMORizing:
    (evaporation as a loss of water).  ERA5-Land reports potential evaporation
    as a positive magnitude, and files written before the sign flip went in
    carry it that way.  Fixing it is a multiplication by -1.
+3. **Missing height coordinate.**  ``tas`` must carry the CMIP6 2 m scalar
+   ``height`` coordinate.  ERA5's t2m carries it through from era5cli/the CDS
+   request API, but the ARCO Zarr stores used by ``zarr_era5.py`` do not
+   publish it at all, so files written before that was added are missing it
+   entirely.  Fixing it adds the scalar coordinate back (value 2.0, units m).
 
 Usage
 -----
@@ -111,6 +116,18 @@ def check_sign(ds: xr.Dataset, name: str, stride: int) -> list[str]:
     return []
 
 
+def check_height(ds: xr.Dataset, name: str) -> list[str]:
+    """tas must carry the CMIP6 2 m scalar height coordinate."""
+    if name != "tas":
+        return []
+    if "height" not in ds.coords:
+        return ["tas has no height coordinate (ERA5-Land ARCO does not publish one)"]
+    value = float(np.asarray(ds["height"].values))
+    if not np.isclose(value, 2.0):
+        return [f"height coordinate is {value}, expected 2.0"]
+    return []
+
+
 def fix_longitude(ds: xr.Dataset) -> xr.Dataset:
     """Relabel to [0, 360) and roll the data so values keep their longitude."""
     lon = np.asarray(ds["lon"].values, dtype="float64")
@@ -147,6 +164,19 @@ def fix_sign(ds: xr.Dataset, name: str) -> xr.Dataset:
     return ds
 
 
+def fix_height(ds: xr.Dataset) -> xr.Dataset:
+    """Attach the missing CMIP6 2 m scalar height coordinate to tas."""
+    ds = ds.assign_coords(height=np.float64(2.0))
+    ds["height"].attrs = {
+        "long_name": "height",
+        "standard_name": "height",
+        "units": "m",
+        "positive": "up",
+        "axis": "Z",
+    }
+    return ds
+
+
 def source_encoding(ds: xr.Dataset) -> dict[str, dict]:
     """Keep the file's own dtypes, compression and time units on rewrite."""
     encoding: dict[str, dict] = {}
@@ -178,7 +208,8 @@ def process_file(path: Path, args: argparse.Namespace) -> tuple[str, list[str]]:
 
         lon_problems = check_longitude(ds)
         sign_problems = check_sign(ds, name, args.sample_stride)
-        problems = lon_problems + sign_problems
+        height_problems = check_height(ds, name)
+        problems = lon_problems + sign_problems + height_problems
         if not problems:
             return "ok", []
         if not args.fix:
@@ -194,13 +225,19 @@ def process_file(path: Path, args: argparse.Namespace) -> tuple[str, list[str]]:
         if any("expected negative" in problem for problem in sign_problems):
             fixed = fix_sign(fixed, name)
             notes.append(f"{name} sign flipped to negative")
+        if height_problems:
+            fixed = fix_height(fixed)
+            notes.append("height coordinate (2 m) added to tas")
         if not notes:
             return "broken", problems + ["nothing could be fixed"]
         fixed = note_history(fixed, notes)
 
         destination = path if args.output_dir is None else args.output_dir / path.name
         tmp = destination.with_suffix(destination.suffix + ".partial")
-        fixed.to_netcdf(tmp, encoding=source_encoding(ds), unlimited_dims=[])
+        encoding = source_encoding(ds)
+        if "height" in fixed.coords and "height" not in encoding:
+            encoding["height"] = {"dtype": "float64", "_FillValue": None}
+        fixed.to_netcdf(tmp, encoding=encoding, unlimited_dims=[])
 
     # The source is closed by here, which Windows requires before the swap.
     os.replace(tmp, destination)
