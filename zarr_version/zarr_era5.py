@@ -166,10 +166,15 @@ class VarSpec:
     instantaneous: bool  # True for state variables, False for accumulations
     cds_name: str | None = None  # CDS request-API name, for fields absent from ARCO
     sign: float = 1.0  # ESMValCore flips evaporation to the CMOR sign convention
+    height: float | None = None  # scalar height coordinate the CMOR table requires
 
 
 VARIABLES: dict[str, VarSpec] = {
-    "tas": VarSpec("t2m", "tas", "day", "E1hr", 1.0, instantaneous=True),
+    # tas carries the height2m scalar coordinate the CMIP6 day table requires; the
+    # ARCO store has no height variable of its own, so it is added at CMORization.
+    # Without it, iris refuses to concatenate these files with the ones the official
+    # ESMValTool cmorizer wrote ("Scalar coordinates differ: height != < None >").
+    "tas": VarSpec("t2m", "tas", "day", "E1hr", 1.0, instantaneous=True, height=2.0),
     "pr": VarSpec("tp", "pr", "day", "E1hr", 1 / 3.6, instantaneous=False),
     "rsds": VarSpec("ssrd", "rsds", "day", "E1hr", 1 / 3600, instantaneous=False),
     # Not in ARCO: fetched from the CDS request API instead. Because ERA5-Land
@@ -357,6 +362,43 @@ def add_spatial_bounds(ds: xr.Dataset) -> xr.Dataset:
             "bounds": "lon_bnds",
         }
     )
+    return ds
+
+
+# The CF attributes ESMValCore's add_scalar_height_coord() puts on the coordinate.
+# Iris compares scalar-coordinate metadata (name, units, attributes, value) before
+# it will concatenate two cubes, so these have to match the files written by the
+# official ESMValTool cmorizer exactly -- hence no "axis": "Z", which that fix does
+# not set. Check a reference file with `ncdump -h` before adding anything here.
+HEIGHT_ATTRS: dict[str, str] = {
+    "standard_name": "height",
+    "long_name": "height",
+    "units": "m",
+    "positive": "up",
+}
+
+
+def suppress_bounds_coordinates(ds: xr.Dataset) -> xr.Dataset:
+    """Keep ``coordinates = "height"`` off the bounds variables.
+
+    A scalar coordinate has no dimensions, so xarray counts it as relevant to
+    every data variable and labels the bounds with it too. CMOR files carry the
+    attribute on the data variable alone; None on the variable's own .encoding
+    suppresses it (the encoding argument to to_netcdf() rejects the key).
+    """
+    for name in ("time_bnds", "lat_bnds", "lon_bnds"):
+        if name in ds:
+            ds[name].encoding["coordinates"] = None
+    return ds
+
+
+def add_height_coord(ds: xr.Dataset, spec: VarSpec) -> xr.Dataset:
+    """Attach the scalar height coordinate the CMOR table asks for (tas: 2 m)."""
+    if spec.height is None or "height" in ds.coords:
+        return ds
+    ds = ds.assign_coords(height=np.float64(spec.height))
+    ds["height"].attrs = dict(HEIGHT_ATTRS)
+    print(f"[INFO] Scalar height = {spec.height} m added to {spec.cmor_name}")
     return ds
 
 
@@ -802,6 +844,7 @@ def finalise(
     }
     ds = add_height_coordinate(ds, spec)
     ds = add_spatial_bounds(ds)
+    ds = add_height_coord(ds, spec)
     ds.attrs = global_attributes(spec, dataset, source, table, "day" if daily else "1hr")
     return ds
 
@@ -891,6 +934,9 @@ def build_encoding(ds: xr.Dataset, spec: VarSpec, daily: bool, complevel: int) -
             "units": ds["time"].encoding["units"],
             "calendar": ds["time"].encoding.get("calendar", TIME_CALENDAR),
         }
+    if "height" in ds.coords:
+        encoding["height"] = {"dtype": "float64", "_FillValue": None}
+        suppress_bounds_coordinates(ds)
     for name in ("time_bnds", "lat_bnds", "lon_bnds"):
         if name in ds:
             encoding[name] = {"_FillValue": None}

@@ -166,6 +166,13 @@ on repaired files reports them as already correct.
 - **Longitude is written as `[0, 360)`**, ascending, matching the ARCO stores' own
   ERA5-Land grid after the wrap. Output written before this was `[-180, 180]`; run
   `zarr_version/fix_cmorized.py` over those files rather than rebuilding them.
+- **`tas` carries the scalar `height = 2 m` coordinate** the CMIP6 `day`/`E1hr` tables ask
+  for. The ARCO stores have no height variable, so it is added at CMORization; without it
+  iris refuses to concatenate these files with ones the official ESMValTool cmorizer wrote
+  (`Scalar coordinates differ: height != < None >`) and any recipe spanning both fails.
+  `py_cmor.py` does *not* add it either. Output written before this went in can be patched
+  with `zarr_version/fix_cmorized.py --fix` — it is a header-only edit, so multi-GB files
+  take seconds and the data is not rewritten.
 - **Both evaporation variables carry a `-1` sign correction**, matching ESMValCore's
   native6 fixes, which flip ERA5's downward-positive evaporation to the CMOR convention.
   Note that `py_cmor.py` does *not* do this, so its `evspsblpot`/`evspsbl` output has the

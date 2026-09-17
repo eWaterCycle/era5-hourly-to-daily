@@ -1,8 +1,8 @@
 #!/usr/bin/env python
 """Check -- and optionally repair -- CMORized ERA5/ERA5-Land netCDF files.
 
-Two things went wrong in files written by earlier versions of this repo, and
-both are cheap to correct in place instead of re-downloading and re-CMORizing:
+Three things went wrong in files written by earlier versions of this repo, and
+all are cheap to correct in place instead of re-downloading and re-CMORizing:
 
 1. **Longitude convention.**  Output was normalised to ``[-180, 180]``; it must
    be ``[0, 360)`` and ascending.  Fixing it is a coordinate relabel plus a
@@ -12,19 +12,13 @@ both are cheap to correct in place instead of re-downloading and re-CMORizing:
    (evaporation as a loss of water).  ERA5-Land reports potential evaporation
    as a positive magnitude, and files written before the sign flip went in
    carry it that way.  Fixing it is a multiplication by -1.
-3. **Missing height coordinate.**  ``tas`` must carry the CMIP6 2 m scalar
-   ``height`` coordinate.  ERA5's t2m carries it through from era5cli/the CDS
-   request API, but the ARCO Zarr stores used by ``zarr_era5.py`` do not
-   publish it at all, so files written before that was added are missing it
-   entirely.  Fixing it adds the scalar coordinate back (value 2.0, units m).
-4. **Longitude floating-point drift.**  The ARCO stores' lon carries ~1e-10
-   degree noise from their own construction -- far finer than the native
-   0.1/0.25 degree resolution, but just enough to push ``lon_bnds`` a hair
-   past the 360-degree modulus.  That breaks ESMValCore/Iris's
-   ``extract_shape``/``extract_region`` ("coordinate's range greater than
-   coordinate's unit's modulus"), even on files whose longitude is already
-   correctly wrapped to ``[0, 360)``.  Fixing it rounds lon to 1e-6 degree and
-   rebuilds ``lon_bnds`` from the cleaned axis.
+3. **Missing scalar height coordinate.**  ``tas`` needs ``height = 2 m``; the
+   ARCO store has no height variable, so files written before that was added
+   have none.  Iris then refuses to concatenate them with the files the
+   official ESMValTool cmorizer wrote ("Scalar coordinates differ: height !=
+   < None >") and recipes spanning both fail.  Fixing it adds a scalar variable
+   and one attribute -- a header-only edit that leaves the data untouched, so
+   it is done in place with netCDF4 even when the rest of the file is fine.
 
 Usage
 -----
@@ -50,15 +44,23 @@ from __future__ import annotations
 
 import argparse
 import os
+import shutil
 import sys
 import traceback
 from pathlib import Path
 
+import netCDF4
 import numpy as np
 import xarray as xr
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from zarr_era5 import VARIABLES, _cell_bounds, human_bytes  # noqa: E402
+from zarr_era5 import (  # noqa: E402
+    HEIGHT_ATTRS,
+    VARIABLES,
+    _cell_bounds,
+    human_bytes,
+    suppress_bounds_coordinates,
+)
 
 # netCDF encoding keys worth carrying over from the source file. Everything
 # else xarray puts in .encoding (source, original_shape, preferred_chunks, ...)
@@ -124,32 +126,63 @@ def check_sign(ds: xr.Dataset, name: str, stride: int) -> list[str]:
     return []
 
 
-def check_lon_precision(ds: xr.Dataset) -> list[str]:
-    """Floating-point drift that pushes lon_bnds past the 360 modulus.
-
-    Independent of check_longitude(): a file can already be correctly wrapped
-    to [0, 360) ascending and still carry this, because the drift lives in
-    the raw lon values themselves, not their ordering.
-    """
-    if "lon_bnds" not in ds.variables:
-        return []
-    bnds = np.asarray(ds["lon_bnds"].values, dtype="float64")
-    span = float(bnds.max() - bnds.min())
-    if span > 360.0:
-        return [f"lon_bnds span {span:.9f} degrees, exceeding the 360 modulus by floating-point drift"]
-    return []
-
-
 def check_height(ds: xr.Dataset, name: str) -> list[str]:
-    """tas must carry the CMIP6 2 m scalar height coordinate."""
-    if name != "tas":
+    """Is the scalar height coordinate the CMOR table asks for there and right?
+
+    Only ``tas`` has one today (2 m). The value and the CF attributes both
+    matter: iris compares the whole coordinate -- name, units, attributes and
+    value -- before it will concatenate two cubes, so a height that is present
+    but described differently is just as fatal as a missing one.
+    """
+    expected = VARIABLES[name].height
+    if expected is None:
         return []
-    if "height" not in ds.coords:
-        return ["tas has no height coordinate (ERA5-Land ARCO does not publish one)"]
-    value = float(np.asarray(ds["height"].values))
-    if not np.isclose(value, 2.0):
-        return [f"height coordinate is {value}, expected 2.0"]
-    return []
+    if "height" not in ds.coords and "height" not in ds.variables:
+        return [f"{name}: scalar height coordinate missing (expected {expected} m)"]
+
+    problems = []
+    value = float(np.asarray(ds["height"].values).reshape(-1)[0])
+    if not np.isclose(value, expected):
+        problems.append(f"{name}: height is {value} m, expected {expected} m")
+    differing = {
+        key: ds["height"].attrs.get(key)
+        for key, wanted in HEIGHT_ATTRS.items()
+        if ds["height"].attrs.get(key) != wanted
+    }
+    if differing:
+        problems.append(f"{name}: height attributes differ from CMOR: {differing}")
+    if "height" not in str(ds[name].encoding.get("coordinates", "")).split():
+        problems.append(f"{name}: does not list height in its coordinates attribute")
+    return problems
+
+
+def fix_height(path: Path, name: str, notes: list[str]) -> None:
+    """Add/correct the scalar height coordinate in place, without a rewrite.
+
+    A scalar variable and one attribute are header-only changes that netCDF4
+    makes without touching the ~10 GB of field data, so this never goes through
+    the xarray read-modify-write path the other fixes use. It is idempotent:
+    running it on an already-correct file changes nothing.
+    """
+    expected = VARIABLES[name].height
+    with netCDF4.Dataset(path, "a") as nc:
+        if "height" in nc.variables:
+            var = nc.variables["height"]
+        else:
+            var = nc.createVariable("height", "f8", ())
+        var.setncatts(dict(HEIGHT_ATTRS))
+        var[...] = float(expected)
+
+        # The data variable has to point at it, or the coordinate is just an
+        # unreferenced scalar and CF readers ignore it.
+        coordinates = getattr(nc.variables[name], "coordinates", "").split()
+        if "height" not in coordinates:
+            coordinates.append("height")
+            nc.variables[name].coordinates = " ".join(coordinates)
+
+        entry = "fix_cmorized.py: " + "; ".join(notes)
+        existing = getattr(nc, "history", "")
+        nc.history = f"{existing}\n{entry}".strip()
 
 
 def fix_longitude(ds: xr.Dataset) -> xr.Dataset:
@@ -178,26 +211,6 @@ def fix_longitude(ds: xr.Dataset) -> xr.Dataset:
     return ds
 
 
-def fix_lon_precision(ds: xr.Dataset) -> xr.Dataset:
-    """Round lon to 1e-6 degree and rebuild lon_bnds from the cleaned axis.
-
-    Safe to call whether or not check_lon_precision() flagged this ds: it is
-    idempotent, and fix_longitude() itself derives fresh lon_bnds from
-    possibly still-drifting lon values, so this is also run after a wrap fix
-    to make sure the result is clean.
-    """
-    lon_attrs, lon_encoding = dict(ds["lon"].attrs), dict(ds["lon"].encoding)
-    bnds_attrs = dict(ds["lon_bnds"].attrs) if "lon_bnds" in ds.variables else {}
-    rounded = np.round(np.asarray(ds["lon"].values, dtype="float64"), 6)
-    ds = ds.assign_coords(lon=rounded)
-    ds["lon"].attrs = lon_attrs
-    ds["lon"].encoding = lon_encoding
-    if "lon_bnds" in ds.variables:
-        ds["lon_bnds"] = (("lon", "bnds"), _cell_bounds(ds["lon"].values))
-        ds["lon_bnds"].attrs = bnds_attrs
-    return ds
-
-
 def fix_sign(ds: xr.Dataset, name: str) -> xr.Dataset:
     """Flip a positive-magnitude evaporation field to the negative convention."""
     attrs = dict(ds[name].attrs)
@@ -205,19 +218,6 @@ def fix_sign(ds: xr.Dataset, name: str) -> xr.Dataset:
     ds[name] = ds[name] * -1.0
     ds[name].attrs = attrs
     ds[name].encoding = encoding
-    return ds
-
-
-def fix_height(ds: xr.Dataset) -> xr.Dataset:
-    """Attach the missing CMIP6 2 m scalar height coordinate to tas."""
-    ds = ds.assign_coords(height=np.float64(2.0))
-    ds["height"].attrs = {
-        "long_name": "height",
-        "standard_name": "height",
-        "units": "m",
-        "positive": "up",
-        "axis": "Z",
-    }
     return ds
 
 
@@ -253,8 +253,7 @@ def process_file(path: Path, args: argparse.Namespace) -> tuple[str, list[str]]:
         lon_problems = check_longitude(ds)
         sign_problems = check_sign(ds, name, args.sample_stride)
         height_problems = check_height(ds, name)
-        precision_problems = check_lon_precision(ds)
-        problems = lon_problems + sign_problems + height_problems + precision_problems
+        problems = lon_problems + sign_problems + height_problems
         if not problems:
             return "ok", []
         if not args.fix:
@@ -262,36 +261,36 @@ def process_file(path: Path, args: argparse.Namespace) -> tuple[str, list[str]]:
         if "has no lon coordinate" in lon_problems:
             return "broken", problems + ["cannot be fixed automatically"]
 
+        destination = path if args.output_dir is None else args.output_dir / path.name
         fixed = ds
         notes: list[str] = []
         if lon_problems:
             fixed = fix_longitude(fixed)
             notes.append("longitude rewritten to [0, 360)")
-        if lon_problems or precision_problems:
-            # fix_longitude() derives lon_bnds from lon values that may still
-            # carry drift, so this always runs after it too, not only when
-            # check_lon_precision() flagged the pre-fix file.
-            fixed = fix_lon_precision(fixed)
-            notes.append("lon rounded to 1e-6 degree to keep lon_bnds within the 360 modulus")
         if any("expected negative" in problem for problem in sign_problems):
             fixed = fix_sign(fixed, name)
             notes.append(f"{name} sign flipped to negative")
-        if height_problems:
-            fixed = fix_height(fixed)
-            notes.append("height coordinate (2 m) added to tas")
-        if not notes:
+        if not notes and not height_problems:
             return "broken", problems + ["nothing could be fixed"]
-        fixed = note_history(fixed, notes)
 
-        destination = path if args.output_dir is None else args.output_dir / path.name
-        tmp = destination.with_suffix(destination.suffix + ".partial")
-        encoding = source_encoding(ds)
-        if "height" in fixed.coords and "height" not in encoding:
-            encoding["height"] = {"dtype": "float64", "_FillValue": None}
-        fixed.to_netcdf(tmp, encoding=encoding, unlimited_dims=[])
+        tmp = None
+        if notes:
+            fixed = note_history(fixed, notes)
+            # The rewrite would relabel the bounds variables with the scalar
+            # height the file already has; CMOR keeps that on the data variable.
+            suppress_bounds_coordinates(fixed)
+            tmp = destination.with_suffix(destination.suffix + ".partial")
+            fixed.to_netcdf(tmp, encoding=source_encoding(ds), unlimited_dims=[])
 
     # The source is closed by here, which Windows requires before the swap.
-    os.replace(tmp, destination)
+    if tmp is not None:
+        os.replace(tmp, destination)
+    elif destination != path:
+        # Only the header needs correcting, but --output-dir asked for the
+        # original to be left alone, so patch a copy of it instead.
+        shutil.copy2(path, destination)
+    if height_problems:
+        fix_height(destination, name, [f"{name} scalar height coordinate set to 2 m"])
     return "fixed", problems
 
 
