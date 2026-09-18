@@ -240,6 +240,12 @@ TIME_UNITS_DAY = "days since 1850-01-01 00:00:00"
 TIME_UNITS_HOUR = "hours since 1850-01-01 00:00:00"
 TIME_CALENDAR = "standard"
 
+# Decimal places the longitude axis is rounded to. Every file this repo writes
+# has to land on the exact same grid -- iris compares coordinate points bit for
+# bit before it will concatenate two cubes -- so fix_cmorized.py rounds to this
+# too. See _tidy_coordinates() for why the rounding is there at all.
+LON_DECIMALS = 6
+
 
 # ---------------------------------------------------------------------------
 # Metadata helpers
@@ -711,32 +717,37 @@ def _tidy_coordinates(ds: xr.Dataset) -> xr.Dataset:
         print("[FIX] Reversing latitude to be ascending (-90 -> +90).")
         ds = ds.sortby("lat")
     if "lon" in ds.coords:
-        # The ARCO stores use [-180, 180] and the CDS request API returns
-        # [0, 360). Normalise to [0, 360) so every variable in a dataset lands
-        # on exactly the same grid regardless of which source it came from.
-        lon = ds["lon"].values
-        if np.any(lon < 0.0):
-            print("[FIX] Wrapping longitude from [-180, 180] to [0, 360).")
-            wrapped = np.where(lon < 0.0, lon + 360.0, lon)
-            ds = ds.assign_coords(lon=wrapped)
-            # Wrapping leaves the axis cyclically rotated rather than randomly
-            # ordered, so roll it back into place. sortby() would work too, but
-            # it is a fancy-index shuffle: on a store chunked along longitude
-            # that becomes an all-to-all rechunk behind HDF5's global read
-            # lock, which effectively hangs. roll is a slice+concat.
-            shift = int(np.argmin(wrapped))
-            if shift:
-                ds = ds.roll(lon=-shift, roll_coords=True)
-        if np.any(np.diff(ds["lon"].values) < 0):
-            print("[FIX] Sorting longitude ascending.")
-            ds = ds.sortby("lon")
         # The ARCO stores' lon carries ~1e-10 degree floating-point drift from
         # their own construction -- far finer than the native 0.1/0.25 degree
         # resolution, but just enough to push lon_bnds a hair past the
         # 360-degree modulus (e.g. 360.00000000001324), which breaks Iris's
         # extract_shape/extract_region ("coordinate's range greater than
-        # coordinate's unit's modulus"). Rounding to 1e-6 degree removes it.
-        ds["lon"] = ds["lon"].copy(data=np.round(ds["lon"].values, 6))
+        # coordinate's unit's modulus"). Round it off first, before the wrap:
+        # the drift puts a -1e-11 where the prime meridian belongs, which is
+        # negative, and wrapping that lands it at 360.0 -- an axis running
+        # 0.1 ... 360.0, one cell off the grid every other file sits on.
+        lon = np.round(np.asarray(ds["lon"].values, dtype="float64"), LON_DECIMALS)
+        # The ARCO stores use [-180, 180] and the CDS request API returns
+        # [0, 360). Normalise to [0, 360) so every variable in a dataset lands
+        # on exactly the same grid regardless of which source it came from.
+        if np.any(lon < 0.0):
+            print("[FIX] Wrapping longitude from [-180, 180] to [0, 360).")
+        # Modulo rather than lon + 360: it also brings a 360.0 left by an older
+        # version of this code back to 0.0. The second rounding is for the wrap
+        # itself, which drifts too (-179.9 + 360 is 180.10000000000002).
+        wrapped = np.round(np.mod(lon, 360.0), LON_DECIMALS)
+        ds["lon"] = ds["lon"].copy(data=wrapped)
+        # Wrapping leaves the axis cyclically rotated rather than randomly
+        # ordered, so roll it back into place. sortby() would work too, but
+        # it is a fancy-index shuffle: on a store chunked along longitude
+        # that becomes an all-to-all rechunk behind HDF5's global read
+        # lock, which effectively hangs. roll is a slice+concat.
+        shift = int(np.argmin(wrapped))
+        if shift:
+            ds = ds.roll(lon=-shift, roll_coords=True)
+        if np.any(np.diff(ds["lon"].values) < 0):
+            print("[FIX] Sorting longitude ascending.")
+            ds = ds.sortby("lon")
     return ds.sortby("time")
 
 

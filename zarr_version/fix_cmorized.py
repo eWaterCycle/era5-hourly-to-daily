@@ -4,10 +4,13 @@
 Three things went wrong in files written by earlier versions of this repo, and
 all are cheap to correct in place instead of re-downloading and re-CMORizing:
 
-1. **Longitude convention.**  Output was normalised to ``[-180, 180]``; it must
-   be ``[0, 360)`` and ascending.  Fixing it is a coordinate relabel plus a
-   cyclic roll of the data, so the values keep the longitudes they belong to.
-   ``lon_bnds`` is recomputed from the corrected axis.
+1. **Longitude convention and drift.**  Output was normalised to
+   ``[-180, 180]``; it must be ``[0, 360)``, ascending, and rounded the way
+   ``zarr_era5.py`` rounds it, or iris puts the file in a concatenation group of
+   its own and recipes spanning it and a freshly generated year fail with
+   "Cannot find an axis to concatenate over".  Fixing it is a coordinate relabel
+   plus a cyclic roll of the data, so the values keep the longitudes they belong
+   to.  ``lon_bnds`` is recomputed from the corrected axis.
 2. **Evaporation sign.**  ``evspsblpot`` / ``evspsbl`` must be negative
    (evaporation as a loss of water).  ERA5-Land reports potential evaporation
    as a positive magnitude, and files written before the sign flip went in
@@ -56,6 +59,7 @@ import xarray as xr
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from zarr_era5 import (  # noqa: E402
     HEIGHT_ATTRS,
+    LON_DECIMALS,
     VARIABLES,
     _cell_bounds,
     human_bytes,
@@ -93,8 +97,20 @@ def check_longitude(ds: xr.Dataset) -> list[str]:
         problems.append(
             f"longitude runs [{lon.min():.3f}, {lon.max():.3f}], expected [0, 360)"
         )
+    elif lon.max() >= 360.0:
+        problems.append(
+            f"longitude runs [{lon.min():.3f}, {lon.max():.3f}], expected [0, 360) "
+            "-- an earlier repair rotated the axis by one cell"
+        )
     elif np.any(np.diff(lon) < 0):
         problems.append("longitude is not ascending")
+    rounded = np.round(lon, LON_DECIMALS)
+    if not np.array_equal(lon, rounded):
+        worst = int(np.argmax(np.abs(lon - rounded)))
+        problems.append(
+            f"longitude carries floating-point drift, e.g. {lon[worst]!r} "
+            f"where zarr_era5.py writes {rounded[worst]!r}"
+        )
     if "lon_bnds" in ds.variables and not problems:
         expected = _cell_bounds(lon)
         if not np.allclose(np.asarray(ds["lon_bnds"].values), expected, atol=1e-6):
@@ -186,14 +202,32 @@ def fix_height(path: Path, name: str, notes: list[str]) -> None:
 
 
 def fix_longitude(ds: xr.Dataset) -> xr.Dataset:
-    """Relabel to [0, 360) and roll the data so values keep their longitude."""
+    """Relabel to [0, 360), round off the drift, and roll the data into order.
+
+    The relabel keeps every value with the longitude it belongs to. The rounding
+    is what makes the repaired file usable next to a freshly generated one: the
+    ARCO stores' own axis carries ~1e-10 degree of drift and wrapping adds more
+    of its own (-179.9 + 360 is 180.10000000000002), while _tidy_coordinates()
+    in zarr_era5.py rounds to LON_DECIMALS. Iris compares coordinate points
+    exactly when it decides whether two cubes belong to the same concatenation
+    group, so an unrounded file silently forms a group of its own and a recipe
+    spanning both years fails with "Cannot find an axis to concatenate over".
+    Rounding to 1e-6 degree is far finer than the native 0.1/0.25 degree grid,
+    so no value moves to a different cell.
+    """
     lon = np.asarray(ds["lon"].values, dtype="float64")
     # assign_coords() replaces the variable outright, taking its CF attributes
     # (units, standard_name, bounds, ...) with it, so put them back by hand.
     lon_attrs, lon_encoding = dict(ds["lon"].attrs), dict(ds["lon"].encoding)
     bnds_attrs = dict(ds["lon_bnds"].attrs) if "lon_bnds" in ds.variables else {}
 
-    wrapped = np.where(lon < 0.0, lon + 360.0, lon)
+    # Round before the wrap, not after: the drift puts a -1e-11 where the prime
+    # meridian belongs, and wrapping that lands it at 360.0 instead of 0.0.
+    # Modulo rather than lon + 360 so that a 360.0 left behind by the version of
+    # this function that rounded too late comes back to 0.0. The second rounding
+    # is for the wrap itself (-179.9 + 360 is 180.10000000000002).
+    lon = np.round(lon, LON_DECIMALS)
+    wrapped = np.round(np.mod(lon, 360.0), LON_DECIMALS)
     ds = ds.assign_coords(lon=wrapped)
     ds["lon"].attrs = lon_attrs
     ds["lon"].encoding = lon_encoding
@@ -266,7 +300,9 @@ def process_file(path: Path, args: argparse.Namespace) -> tuple[str, list[str]]:
         notes: list[str] = []
         if lon_problems:
             fixed = fix_longitude(fixed)
-            notes.append("longitude rewritten to [0, 360)")
+            notes.append(
+                f"longitude rewritten to [0, 360) and rounded to {LON_DECIMALS} decimals"
+            )
         if any("expected negative" in problem for problem in sign_problems):
             fixed = fix_sign(fixed, name)
             notes.append(f"{name} sign flipped to negative")
